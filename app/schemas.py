@@ -142,13 +142,25 @@ class VerifyRequest(BaseModel):
     )
 
 
+class VerificationCancellation(BaseModel):
+    """核验流水上的取消登记（附加快照，不影响原核验字段）。"""
+
+    id: int = Field(description="取消登记编号")
+    reason: str = Field(description="取消原因")
+    cancelled_at: str = Field(description="取消登记时间（UTC）")
+    license_id: Optional[int] = Field(description="取消时关联（回退）的授权 id")
+    pool_id: Optional[int] = Field(
+        description="取消时关联（回退）的共享池 id；授权未绑池时为 null"
+    )
+
+
 class VerificationOut(BaseModel):
     id: int
     idempotency_key: str
     film_id: str
     venue_id: str
     start_time: str
-    decision: str = Field(description="approved 或 rejected")
+    decision: str = Field(description="approved 或 rejected（取消后仍保持原决定）")
     license_id: Optional[int] = Field(description="命中并消耗额度的授权 id")
     pool_id: Optional[int] = Field(
         description="本次核准同时消耗的共享池 id；授权未绑池或被拒绝时为 null"
@@ -157,9 +169,48 @@ class VerificationOut(BaseModel):
         description="拒绝原因：NO_LICENSE / TIME_OUT_OF_WINDOW / LICENSE_REVOKED / "
                     "LICENSE_SUSPENDED / QUOTA_EXHAUSTED / POOL_EXHAUSTED"
     )
-    remaining_quota: Optional[int] = Field(description="本次消耗后该授权自身的剩余额度")
+    remaining_quota: Optional[int] = Field(
+        description="本次扣减时该授权自身剩余的快照；取消后保持原样不回写"
+    )
     pool_remaining_quota: Optional[int] = Field(
-        description="本次消耗后所绑共享池的剩余额度；授权未绑池或被拒绝时为 null"
+        description="本次扣减时所绑共享池剩余的快照；取消后保持原样不回写"
     )
     verified_at: str
     replay: bool = Field(description="true 表示本次为幂等重放，未重新扣减额度")
+    cancelled: bool = Field(
+        default=False,
+        description="该核准场次是否已临时取消；新增字段，旧客户端可忽略",
+    )
+    cancellation: Optional[VerificationCancellation] = Field(
+        default=None,
+        description="取消登记（取消时间、原因、关联授权与共享池）；未取消为 null",
+    )
+
+
+class CancellationRequest(BaseModel):
+    reason: str = Field(
+        min_length=1, max_length=500,
+        description="非空取消原因；同键重复提交须与首次一致，否则 409",
+        examples=["台风预警，场次临时取消"],
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value
+
+
+class CancellationOut(BaseModel):
+    id: int = Field(description="取消登记编号")
+    idempotency_key: str = Field(description="原核验幂等键")
+    verification_id: int = Field(description="关联核验流水 id")
+    license_id: Optional[int] = Field(
+        description="本次取消回退的授权 id（核准命中的授权）"
+    )
+    pool_id: Optional[int] = Field(
+        description="本次取消回退的共享池 id；授权未绑池时为 null"
+    )
+    reason: str
+    cancelled_at: str

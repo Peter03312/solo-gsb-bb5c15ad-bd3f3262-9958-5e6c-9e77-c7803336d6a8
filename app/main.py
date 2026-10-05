@@ -11,6 +11,8 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from .schemas import (
+    CancellationOut,
+    CancellationRequest,
     LicenseCreate,
     LicenseOut,
     PoolCreate,
@@ -64,8 +66,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     app = FastAPI(
         title="Film Festival Screening License Service",
-        version="1.1.0",
-        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制与撤销追溯",
+        version="1.2.0",
+        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、"
+                    "已核准场次临时取消（幂等、开场前、释放额度）、额度控制与撤销追溯",
         lifespan=lifespan,
     )
     app.state.store = store
@@ -98,7 +101,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def root():
         return {
             "service": "film-festival-licensing",
-            "version": "1.1.0",
+            "version": "1.2.0",
             "docs": "/docs",
             "health": "/health",
         }
@@ -250,15 +253,20 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         decision: Optional[str] = Query(default=None, pattern="^(approved|rejected)$"),
         license_id: Optional[int] = Query(default=None),
         pool_id: Optional[int] = Query(default=None),
+        cancelled: Optional[bool] = Query(
+            default=None,
+            description="true 仅返回已取消流水，false 仅返回未取消流水，不传返回全部",
+        ),
         limit: int = Query(default=200, ge=1, le=1000),
     ):
-        """核验流水（含已核准场次的可追溯记录）。"""
+        """核验流水（含已核准场次及其取消状态，可追溯）。"""
         return store.list_verifications(
             film_id=film_id,
             venue_id=venue_id,
             decision=decision,
             license_id=license_id,
             pool_id=pool_id,
+            cancelled=cancelled,
             limit=limit,
         )
 
@@ -269,6 +277,67 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     )
     def get_verification(idempotency_key: str):
         return store.get_verification(idempotency_key)
+
+    # ------------------------------------------------------------------
+    # cancellations of approved screenings
+    # ------------------------------------------------------------------
+    @app.post(
+        "/verifications/{idempotency_key}/cancellation",
+        response_model=CancellationOut,
+        tags=["cancellations"],
+    )
+    def cancel_verification(idempotency_key: str, body: CancellationRequest):
+        """按原核验幂等键登记已核准场次的临时取消。
+
+        - 仅可在场次开始前取消 **approved** 流水；幂等键未知 → 404；
+          被拒绝流水 → 422 ``VERIFICATION_NOT_APPROVED``；已开场
+          （now >= start_time）→ 422 ``SCREENING_ALREADY_STARTED``；
+        - 原因必须非空；同键同原因重复提交 → 首次记录（不重复释放额度）；
+          同键不同原因 → 409 并在 ``existing`` 字段附首次取消记录；
+        - 取消后命中授权与其所绑共享池的实时已用次数各回退一次，后续核验
+          可使用释放额度；原核验决定、扣减时余额快照与同键重放结果不变；
+        - 取消与新核验在同一 ``BEGIN IMMEDIATE`` 写锁下串行，不超额、不重复释放。
+        """
+        return store.cancel_verification(idempotency_key, body.reason)
+
+    @app.get(
+        "/verifications/{idempotency_key}/cancellation",
+        response_model=CancellationOut,
+        tags=["cancellations"],
+    )
+    def get_verification_cancellation(idempotency_key: str):
+        """查询某次核验的取消登记（取消时间、原因、关联授权与共享池）。
+
+        核验不存在或从未取消均返回 404；取消状态也可直接通过
+        ``GET /verifications/{idempotency_key}`` 的 ``cancelled`` /
+        ``cancellation`` 字段查看。
+        """
+        return store.get_cancellation_by_key(idempotency_key)
+
+    @app.get("/cancellations", response_model=list[CancellationOut], tags=["cancellations"])
+    def list_cancellations(
+        license_id: Optional[int] = Query(default=None),
+        pool_id: Optional[int] = Query(default=None),
+        film_id: Optional[str] = Query(default=None),
+        venue_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1000),
+    ):
+        """列出全部取消登记，可按授权 / 共享池 / 影片 / 场馆过滤。"""
+        return store.list_cancellations(
+            license_id=license_id,
+            pool_id=pool_id,
+            film_id=film_id,
+            venue_id=venue_id,
+            limit=limit,
+        )
+
+    @app.get(
+        "/cancellations/{cancellation_id}",
+        response_model=CancellationOut,
+        tags=["cancellations"],
+    )
+    def get_cancellation(cancellation_id: int):
+        return store.get_cancellation(cancellation_id)
 
     return app
 

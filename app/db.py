@@ -65,6 +65,23 @@ CREATE TABLE IF NOT EXISTS verifications (
 );
 CREATE INDEX IF NOT EXISTS idx_verifications_license
     ON verifications (license_id, decision);
+
+-- 已核准场次的临时取消：按原核验幂等键登记，全库唯一。
+-- 取消不修改 verifications 原行（决定/余额快照保持原样）；授权与池的
+-- 实时已用次数统计时排除存在对应取消记录的 approved 流水，即"各回退一次"。
+CREATE TABLE IF NOT EXISTS cancellations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT    NOT NULL UNIQUE,      -- 与核验幂等键一致
+    verification_id INTEGER NOT NULL UNIQUE REFERENCES verifications (id),
+    license_id      INTEGER,                      -- 取消时关联的授权（原命中授权快照）
+    pool_id         INTEGER,                      -- 取消时关联的共享池（未绑池为 NULL）
+    reason          TEXT    NOT NULL,             -- 非空取消原因
+    cancelled_at    TEXT    NOT NULL              -- canonical UTC ISO-8601
+);
+CREATE INDEX IF NOT EXISTS idx_cancellations_license
+    ON cancellations (license_id);
+CREATE INDEX IF NOT EXISTS idx_cancellations_pool
+    ON cancellations (pool_id);
 """
 
 # Columns added after the initial release; applied lazily so databases
