@@ -1,15 +1,16 @@
 # 电影节片源放映许可核验服务
 
-基于 **Python + FastAPI + SQLite** 的放映许可核验服务：录入影片/场馆授权（有效时段、场次上限、撤销记录、限时暂停），对待核验场次进行**幂等、并发安全**的准入判定，返回准入结果、命中授权、剩余额度与拒绝原因。
+基于 **Python + FastAPI + SQLite** 的放映许可核验服务：录入影片/场馆授权（有效时段、场次上限、撤销记录、限时暂停），对待核验场次进行**幂等、并发安全**的准入判定，返回准入结果、命中授权、剩余额度与拒绝原因；已核准且未开场的场次可按原幂等键**取消**并释放额度。
 
 ## 功能特性
 
 - **授权管理**：录入影片、场馆、有效时段、场次上限；查询实时已用/剩余额度
 - **影片级共享额度池**：发行方可为影片登记**跨场馆总放映次数**池；授权录入时可选绑池（绑定后不可改），核准时授权与所绑池**各消耗一次**，池耗尽返回 `POOL_EXHAUSTED`
 - **限时暂停**：运营可为单份授权登记带时区起止时刻的暂停区间（左闭右开，重叠按并集生效，登记后不可改）；暂停只影响**此后提交**且场次开始落入区间的新核验，既有流水与额度占用不变
+- **场次取消**：已核准且**尚未开场**的场次可按原核验幂等键取消（非空原因）；取消后授权与所绑池的实时已用次数**各回退一次**，释放额度可被后续核验使用；原核验决定与扣减快照保持原样，核验查询可见取消状态
 - **核验判定**：多份授权同时有效时只消耗一份额度，**跳过已撤销/已暂停授权**，优先最早到期且自身与所绑池均有余额的授权；覆盖时段且未撤销的授权全部暂停时返回 `LICENSE_SUSPENDED`
-- **并发安全**：核验的"查状态 + 扣额度"与暂停登记均在单个 `BEGIN IMMEDIATE` 事务内串行化，SQLite WAL 模式下写请求串行化，**每次核验决定都对应暂停登记前或登记后的完整状态**
-- **幂等语义**：同一业务幂等键重试返回原结果（`replay=true`，不重复扣额度、不重复占池、不受此后暂停影响）；键相同但请求内容变化返回 **409 冲突**
+- **并发安全**：核验的"查状态 + 扣额度"、暂停登记与场次取消均在单个 `BEGIN IMMEDIATE` 事务内串行化，SQLite WAL 模式下写请求串行化，**每次核验决定都对应暂停/取消登记前或登记后的完整状态**，取消与核验并发不超额、不重复释放
+- **幂等语义**：同一业务幂等键重试返回原结果（`replay=true`，不重复扣额度、不重复占池、不受此后暂停影响）；键相同但请求内容变化返回 **409 冲突**；取消同样幂等——重复取消返回首次记录、不重复释放，原因不同返回 **409**
 - **撤销语义**：撤销仅阻止后续核验；已核准场次记录及其池占用保留、不退还、可追溯
 - **明确拒绝**：时间不在任何授权时段、授权已撤销、授权全部暂停、额度用尽、共享池耗尽、无授权时分别返回具体拒绝原因
 
@@ -45,7 +46,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 运行测试
 
 ```bash
-pytest -q        # 54 个用例，含 20 线程授权不超额 / 40 线程跨场馆不突破池上限 / 暂停登记与核验并发状态一致性
+pytest -q        # 70 个用例，含 20 线程授权不超额 / 40 线程跨场馆不突破池上限 / 暂停登记与核验并发状态一致性 / 取消与核验并发不超额不重复释放
 ```
 
 ### 调用示例脚本
@@ -66,6 +67,12 @@ bash examples/demo_pools.sh
 
 ```bash
 bash examples/demo_suspensions.sh
+```
+
+已核准场次取消完整演示（取消 → 额度回退 → 幂等重放 → 原因冲突 → 释放额度复用 → 已拒绝/已开场/未知键拒绝）：
+
+```bash
+bash examples/demo_cancellations.sh
 ```
 
 ## 配置项（环境变量）
@@ -93,8 +100,9 @@ bash examples/demo_suspensions.sh
 | GET | `/suspensions` | 全部暂停记录，可按 `license_id` 过滤（只读、不可改） |
 | GET | `/suspensions/{id}` | 单条暂停记录详情 |
 | POST | `/verifications` | 核验场次（幂等） |
-| GET | `/verifications` | 核验流水，可按 `film_id`/`venue_id`/`decision`/`license_id`/`pool_id` 过滤 |
-| GET | `/verifications/{idempotency_key}` | 按幂等键查询单条核验记录 |
+| GET | `/verifications` | 核验流水（含取消状态），可按 `film_id`/`venue_id`/`decision`/`license_id`/`pool_id` 过滤 |
+| GET | `/verifications/{idempotency_key}` | 按幂等键查询单条核验记录（含取消状态） |
+| POST | `/verifications/{idempotency_key}/cancel` | 取消已核准且未开场的场次（幂等；未知键 404，已拒绝/已开场 422，原因不同 409） |
 
 ### 调用示例（curl）
 
@@ -134,7 +142,9 @@ curl -X POST http://localhost:8000/verifications \
   "remaining_quota": 4,
   "pool_remaining_quota": null,
   "verified_at": "2026-10-04T08:00:00.000000Z",
-  "replay": false
+  "replay": false,
+  "cancelled": false,
+  "cancellation": null
 }
 ```
 
@@ -157,6 +167,49 @@ curl -X POST http://localhost:8000/verifications \
 ```bash
 curl -X POST http://localhost:8000/licenses/3/revoke \
   -H 'Content-Type: application/json' -d '{"reason":"版权方临时撤片"}'
+```
+
+### 已核准场次取消
+
+已核准且**尚未开场**的场次可按原核验幂等键取消（原因必填、非空白）：
+
+```bash
+curl -X POST http://localhost:8000/verifications/screening-0001/cancel \
+  -H 'Content-Type: application/json' -d '{"reason":"放映设备故障，场次取消"}'
+```
+
+响应返回**取消时间、原因及关联授权和共享池**：
+
+```json
+{
+  "id": 1,
+  "idempotency_key": "screening-0001",
+  "verification_id": 1,
+  "license_id": 3,
+  "pool_id": 1,
+  "reason": "放映设备故障，场次取消",
+  "cancelled_at": "2026-10-05T02:10:00.000000Z",
+  "replay": false
+}
+```
+
+- 取消成功后，该授权及所绑共享池的**实时已用次数各回退一次**（`/licenses`、`/pools` 立即可见），释放的额度可被后续核验使用
+- 未知幂等键 → `404 {"code":"NOT_FOUND"}`；已拒绝的流水 → `422 {"code":"VERIFICATION_NOT_APPROVED"}`；场次已开场（开始时间已到）→ `422 {"code":"SESSION_ALREADY_STARTED"}`；原因为空白 → `422`，均**不留任何记录**
+- **重复提交相同取消**返回首次记录（`replay=true`），额度不重复释放；同一键但**原因不同** → `409`，`existing` 字段附首次取消记录
+- 原核验流水的 `decision`、扣减时余额快照（`remaining_quota`/`pool_remaining_quota`）及同键重放结果**保持原样**；核验查询（`GET /verifications`、`GET /verifications/{key}`）通过 `cancelled`/`cancellation` 字段可见取消状态：
+
+```json
+{
+  "idempotency_key": "screening-0001",
+  "decision": "approved",
+  "remaining_quota": 4,
+  "replay": false,
+  "cancelled": true,
+  "cancellation": {
+    "reason": "放映设备故障，场次取消",
+    "cancelled_at": "2026-10-05T02:10:00.000000Z"
+  }
+}
 ```
 
 ### 授权限时暂停
@@ -277,9 +330,11 @@ curl 'http://localhost:8000/licenses?pool_id=1'
 
 **幂等**：`idempotency_key` 全库唯一。重试同一键且请求内容（影片、场馆、开始时间）一致 → 返回首次存储的结果并标记 `replay=true`，不重复扣额度、**不重复占用池**、也不受首次登记之后新增的暂停影响；内容不一致 → `409` 并在 `existing` 字段附上首次结果。
 
+**场次取消**：取消记录独立存表（每条核验流水至多一条，唯一约束兜底）。仅**已核准且场次开始时间未到**的流水可取消；取消不回写原核验行——`decision` 仍为 `approved`、扣减时余额快照不变、同键重放仍返回首次结果——但实时已用次数统计（授权与所绑池）会**排除已取消流水**，即各回退一次，释放额度立即可被后续核验使用。取消本身按原幂等键幂等：同键同原因重放返回首次记录（`replay=true`），同键不同原因 `409`。已取消流水在核验查询中标记 `cancelled=true` 并附 `cancellation`（原因、取消时间），`decision` 过滤仍按其原决定归类。
+
 **撤销**：撤销记录独立存表。被撤销的授权不再参与后续核验；撤销前已核准的场次记录及其池占用原样保留、**不予退还**，可通过 `/verifications` 与 `/verifications/{key}` 追溯。
 
-**并发**：所有核验在 `BEGIN IMMEDIATE` 事务内完成"查重 → 读暂停 → 选授权 → 扣额度（含池） → 落库"，暂停登记同样以 `BEGIN IMMEDIATE` 串行插入；SQLite 写锁将两类写请求统一串行化，因此暂停登记与核验并发时，**每次核验决定都对应登记前或登记后的完整状态**，不会读到"暂停只生效一半"。WAL 模式 + 30s busy_timeout 保证读写不互相阻塞。测试以 20 线程并发抢 3 场授权额度、40 线程跨 4 场馆抢容量 5 的池，以及 20 路核验与 1 路暂停登记同时开跑验证：批准数恰好等于上限、其余按原因为 `QUOTA_EXHAUSTED` / `POOL_EXHAUSTED` / `LICENSE_SUSPENDED` 拒绝，额度占用与批准数严格一致。
+**并发**：所有核验在 `BEGIN IMMEDIATE` 事务内完成"查重 → 读暂停 → 选授权 → 扣额度（含池） → 落库"，暂停登记与场次取消同样以 `BEGIN IMMEDIATE` 串行写入；SQLite 写锁将三类写请求统一串行化，因此暂停/取消登记与核验并发时，**每次核验决定都对应登记前或登记后的完整状态**，不会读到"暂停只生效一半"，取消与核验并发也**不会超额或重复释放**（取消的唯一约束保证每条流水至多释放一次）。WAL 模式 + 30s busy_timeout 保证读写不互相阻塞。测试以 20 线程并发抢 3 场授权额度、40 线程跨 4 场馆抢容量 5 的池、20 路核验与 1 路暂停登记同时开跑、20 路核验与 1 路取消并发及 10 路同键并发取消验证：批准数恰好等于上限、其余按原因为 `QUOTA_EXHAUSTED` / `POOL_EXHAUSTED` / `LICENSE_SUSPENDED` 拒绝，额度占用与批准数严格一致，取消后实时已用次数恰好回退一次。
 
 **拒绝原因**（`reject_reason`）：
 
@@ -301,18 +356,20 @@ curl 'http://localhost:8000/licenses?pool_id=1'
 ```
 app/
   main.py       # FastAPI 入口与路由（create_app 工厂）
-  service.py    # 业务逻辑：额度池/授权/撤销/限时暂停/幂等核验/授权选择
+  service.py    # 业务逻辑：额度池/授权/撤销/限时暂停/幂等核验/场次取消/授权选择
   db.py         # SQLite 连接与建表（WAL、外键、busy_timeout、旧库迁移）
   schemas.py    # Pydantic 请求/响应模型
   timeutil.py   # UTC 时间规范化
 tests/
-  test_api.py        # API 端到端测试 + 并发不超额测试
-  test_pools.py      # 共享额度池：绑定校验/跨场馆/池耗尽/撤销不退/并发不突破上限
-  test_suspensions.py # 限时暂停：登记校验/左闭右开/并集/跳过选择/拒绝原因次序/幂等/并发状态一致
+  test_api.py           # API 端到端测试 + 并发不超额测试
+  test_pools.py         # 共享额度池：绑定校验/跨场馆/池耗尽/撤销不退/并发不突破上限
+  test_suspensions.py   # 限时暂停：登记校验/左闭右开/并集/跳过选择/拒绝原因次序/幂等/并发状态一致
+  test_cancellations.py # 场次取消：登记校验/额度与池回退/幂等重放/原因冲突/原样保持/并发不超额不重复释放
 examples/
-  demo.sh             # 完整调用示例脚本
-  demo_pools.sh       # 共享额度池调用示例脚本
-  demo_suspensions.sh # 授权限时暂停调用示例脚本
+  demo.sh                # 完整调用示例脚本
+  demo_pools.sh          # 共享额度池调用示例脚本
+  demo_suspensions.sh    # 授权限时暂停调用示例脚本
+  demo_cancellations.sh  # 已核准场次取消调用示例脚本
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

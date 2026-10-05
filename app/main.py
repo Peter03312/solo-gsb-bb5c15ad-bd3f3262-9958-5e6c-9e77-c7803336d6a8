@@ -11,6 +11,8 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from .schemas import (
+    CancelOut,
+    CancelRequest,
     LicenseCreate,
     LicenseOut,
     PoolCreate,
@@ -64,8 +66,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     app = FastAPI(
         title="Film Festival Screening License Service",
-        version="1.1.0",
-        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制与撤销追溯",
+        version="1.2.0",
+        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制、撤销追溯与已核准场次取消",
         lifespan=lifespan,
     )
     app.state.store = store
@@ -98,7 +100,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def root():
         return {
             "service": "film-festival-licensing",
-            "version": "1.1.0",
+            "version": "1.2.0",
             "docs": "/docs",
             "health": "/health",
         }
@@ -269,6 +271,23 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     )
     def get_verification(idempotency_key: str):
         return store.get_verification(idempotency_key)
+
+    @app.post(
+        "/verifications/{idempotency_key}/cancel",
+        response_model=CancelOut,
+        tags=["verifications"],
+    )
+    def cancel_verification(idempotency_key: str, body: CancelRequest):
+        """按原核验幂等键取消一个已核准且尚未开场的场次（幂等）。
+
+        - 仅已核准（approved）且场次开始时间未到的流水可取消；未知键 404，
+          已拒绝流水或已开场的场次 422；
+        - 取消成功后该授权及所绑共享池的实时已用次数各回退一次，释放的
+          额度可被后续核验使用；原核验决定与扣减时余额快照保持原样；
+        - 重复提交相同取消返回首次记录（replay=true），不重复释放额度；
+          同一键但取消原因不同返回 409。
+        """
+        return store.cancel_verification(idempotency_key, reason=body.reason)
 
     return app
 

@@ -23,7 +23,16 @@ REASON_LICENSE_SUSPENDED = "LICENSE_SUSPENDED"  # 覆盖该时段且未撤销的
 REASON_QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"   # 授权有效但场次额度已用完
 REASON_POOL_EXHAUSTED = "POOL_EXHAUSTED"     # 授权自身有余额，但所绑影片级共享池已耗尽
 
-_LICENSE_SELECT = """
+# 已取消的核准流水不再占用授权/池额度：取消登记后实时已用次数回退，
+# 释放出的额度可被后续核验使用；原核验行及其快照保持原样。
+_ACTIVE_APPROVED = """
+    v.decision = 'approved'
+    AND NOT EXISTS (
+        SELECT 1 FROM cancellations c WHERE c.verification_id = v.id
+    )
+"""
+
+_LICENSE_SELECT = f"""
 SELECT
     l.id,
     l.film_id,
@@ -44,19 +53,19 @@ SELECT
     (
         SELECT COUNT(*)
         FROM verifications v
-        WHERE v.license_id = l.id AND v.decision = 'approved'
+        WHERE v.license_id = l.id AND {_ACTIVE_APPROVED}
     ) AS used_sessions,
     (
         SELECT COUNT(*)
         FROM verifications v
-        WHERE v.pool_id = l.pool_id AND v.decision = 'approved'
+        WHERE v.pool_id = l.pool_id AND {_ACTIVE_APPROVED}
     ) AS pool_used_sessions
 FROM licenses l
 LEFT JOIN revocations r ON r.license_id = l.id
 LEFT JOIN quota_pools p ON p.id = l.pool_id
 """
 
-_POOL_SELECT = """
+_POOL_SELECT = f"""
 SELECT
     p.id,
     p.film_id,
@@ -66,7 +75,7 @@ SELECT
     (
         SELECT COUNT(*)
         FROM verifications v
-        WHERE v.pool_id = p.id AND v.decision = 'approved'
+        WHERE v.pool_id = p.id AND {_ACTIVE_APPROVED}
     ) AS used_sessions,
     (
         SELECT COUNT(*)
@@ -74,6 +83,18 @@ SELECT
         WHERE l.pool_id = p.id
     ) AS license_count
 FROM quota_pools p
+"""
+
+# 核验查询统一左联取消记录：取消状态（cancelled/cancellation）随流水返回，
+# 原核验决定与扣减时余额快照字段保持原样。
+_VERIFICATION_SELECT = """
+SELECT
+    v.*,
+    c.id           AS cancel_id,
+    c.reason       AS cancel_reason,
+    c.cancelled_at AS cancelled_at
+FROM verifications v
+LEFT JOIN cancellations c ON c.verification_id = v.id
 """
 
 
@@ -174,6 +195,7 @@ def _suspension_out(row: sqlite3.Row) -> dict:
 
 
 def _verification_out(row: sqlite3.Row, replay: bool) -> dict:
+    cancelled = row["cancel_id"] is not None
     return {
         "id": row["id"],
         "idempotency_key": row["idempotency_key"],
@@ -187,6 +209,27 @@ def _verification_out(row: sqlite3.Row, replay: bool) -> dict:
         "remaining_quota": row["remaining_quota"],
         "pool_remaining_quota": row["pool_remaining_quota"],
         "verified_at": row["created_at"],
+        "replay": replay,
+        "cancelled": cancelled,
+        "cancellation": (
+            {"reason": row["cancel_reason"], "cancelled_at": row["cancelled_at"]}
+            if cancelled
+            else None
+        ),
+    }
+
+
+def _cancel_out(cancel_row: sqlite3.Row, verification_row: sqlite3.Row,
+                replay: bool) -> dict:
+    """Cancellation record joined with the verification it released."""
+    return {
+        "id": cancel_row["id"],
+        "idempotency_key": cancel_row["idempotency_key"],
+        "verification_id": cancel_row["verification_id"],
+        "license_id": verification_row["license_id"],
+        "pool_id": verification_row["pool_id"],
+        "reason": cancel_row["reason"],
+        "cancelled_at": cancel_row["cancelled_at"],
         "replay": replay,
     }
 
@@ -554,7 +597,7 @@ class Store:
                 conn.execute("BEGIN IMMEDIATE")
 
                 existing = conn.execute(
-                    "SELECT * FROM verifications WHERE idempotency_key = ?",
+                    _VERIFICATION_SELECT + " WHERE v.idempotency_key = ?",
                     (idempotency_key,),
                 ).fetchone()
                 if existing is not None:
@@ -627,6 +670,8 @@ class Store:
                     "pool_remaining_quota": pool_remaining,
                     "verified_at": created_at,
                     "replay": False,
+                    "cancelled": False,
+                    "cancellation": None,
                 }
             except ConflictError:
                 raise
@@ -640,7 +685,7 @@ class Store:
     def get_verification(self, idempotency_key: str) -> dict:
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT * FROM verifications WHERE idempotency_key = ?",
+                _VERIFICATION_SELECT + " WHERE v.idempotency_key = ?",
                 (idempotency_key,),
             ).fetchone()
         if row is None:
@@ -657,27 +702,120 @@ class Store:
         pool_id: Optional[int] = None,
         limit: int = 200,
     ) -> list:
-        sql = "SELECT * FROM verifications"
+        sql = _VERIFICATION_SELECT
         clauses, params = [], []
         if film_id is not None:
-            clauses.append("film_id = ?")
+            clauses.append("v.film_id = ?")
             params.append(film_id)
         if venue_id is not None:
-            clauses.append("venue_id = ?")
+            clauses.append("v.venue_id = ?")
             params.append(venue_id)
         if decision is not None:
-            clauses.append("decision = ?")
+            clauses.append("v.decision = ?")
             params.append(decision)
         if license_id is not None:
-            clauses.append("license_id = ?")
+            clauses.append("v.license_id = ?")
             params.append(license_id)
         if pool_id is not None:
-            clauses.append("pool_id = ?")
+            clauses.append("v.pool_id = ?")
             params.append(pool_id)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY id DESC LIMIT ?"
+        sql += " ORDER BY v.id DESC LIMIT ?"
         params.append(limit)
         with self._connection() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [_verification_out(r, replay=False) for r in rows]
+
+    # ------------------------------------------------------------------
+    # cancellations (approved sessions called off before they start)
+    # ------------------------------------------------------------------
+    def cancel_verification(self, idempotency_key: str, *, reason: str) -> dict:
+        """Cancel an approved, not-yet-started screening by its idempotency key.
+
+        The whole lookup-check-insert runs inside one ``BEGIN IMMEDIATE``
+        transaction, serialised against concurrent verifications and
+        cancellations by the SQLite write lock; the ``UNIQUE`` constraint on
+        ``cancellations.verification_id`` is the final guard, so the license
+        quota and the bound pool are each released **at most once** per
+        verification and a concurrent verify can never oversell the freed
+        unit.  The verification row itself (decision, balance snapshots) is
+        never touched — only the live used counters derived from it change.
+
+        Re-submitting the same cancellation returns the first record
+        (``replay=True``) without releasing quota again; a different reason
+        for the same key conflicts (409).
+        """
+        with self._connection() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                verification = conn.execute(
+                    "SELECT * FROM verifications WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if verification is None:
+                    conn.execute("ROLLBACK")
+                    raise NotFoundError(
+                        f"verification '{idempotency_key}' not found"
+                    )
+
+                existing = conn.execute(
+                    "SELECT * FROM cancellations WHERE verification_id = ?",
+                    (verification["id"],),
+                ).fetchone()
+                if existing is not None:
+                    conn.execute("COMMIT")
+                    if existing["reason"] != reason:
+                        raise ConflictError(
+                            "verification "
+                            f"'{idempotency_key}' was already cancelled with "
+                            "a different reason",
+                            existing=_cancel_out(existing, verification,
+                                                 replay=True),
+                        )
+                    return _cancel_out(existing, verification, replay=True)
+
+                if verification["decision"] != DECISION_APPROVED:
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"verification '{idempotency_key}' was rejected and "
+                        "cannot be cancelled",
+                        code="VERIFICATION_NOT_APPROVED",
+                    )
+                # 仅可在场次开始前取消；开始时间已过（含恰在此刻）一律拒绝
+                if verification["start_time"] <= now_iso():
+                    conn.execute("ROLLBACK")
+                    raise UnprocessableError(
+                        f"screening '{idempotency_key}' has already started "
+                        "and cannot be cancelled",
+                        code="SESSION_ALREADY_STARTED",
+                    )
+
+                cancelled_at = now_iso()
+                cur = conn.execute(
+                    """
+                    INSERT INTO cancellations
+                        (verification_id, idempotency_key, reason, cancelled_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (verification["id"], idempotency_key, reason, cancelled_at),
+                )
+                conn.execute("COMMIT")
+                return {
+                    "id": cur.lastrowid,
+                    "idempotency_key": idempotency_key,
+                    "verification_id": verification["id"],
+                    "license_id": verification["license_id"],
+                    "pool_id": verification["pool_id"],
+                    "reason": reason,
+                    "cancelled_at": cancelled_at,
+                    "replay": False,
+                }
+            except (NotFoundError, ConflictError, UnprocessableError):
+                raise
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise

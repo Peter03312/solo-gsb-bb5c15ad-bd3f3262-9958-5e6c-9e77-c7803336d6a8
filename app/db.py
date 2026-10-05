@@ -65,6 +65,17 @@ CREATE TABLE IF NOT EXISTS verifications (
 );
 CREATE INDEX IF NOT EXISTS idx_verifications_license
     ON verifications (license_id, decision);
+
+CREATE TABLE IF NOT EXISTS cancellations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    verification_id INTEGER NOT NULL UNIQUE REFERENCES verifications (id),
+    idempotency_key TEXT    NOT NULL,             -- 冗余原核验幂等键，便于按键查询
+    reason          TEXT    NOT NULL,
+    cancelled_at    TEXT    NOT NULL
+);
+-- 每条核验流水至多一条取消记录：唯一约束在并发取消时兜底，额度不会重复释放
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cancellations_key
+    ON cancellations (idempotency_key);
 """
 
 # Columns added after the initial release; applied lazily so databases

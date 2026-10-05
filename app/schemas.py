@@ -142,13 +142,18 @@ class VerifyRequest(BaseModel):
     )
 
 
+class CancellationOut(BaseModel):
+    reason: str
+    cancelled_at: str
+
+
 class VerificationOut(BaseModel):
     id: int
     idempotency_key: str
     film_id: str
     venue_id: str
     start_time: str
-    decision: str = Field(description="approved 或 rejected")
+    decision: str = Field(description="approved 或 rejected；取消不回写，保持首次决定")
     license_id: Optional[int] = Field(description="命中并消耗额度的授权 id")
     pool_id: Optional[int] = Field(
         description="本次核准同时消耗的共享池 id；授权未绑池或被拒绝时为 null"
@@ -157,9 +162,37 @@ class VerificationOut(BaseModel):
         description="拒绝原因：NO_LICENSE / TIME_OUT_OF_WINDOW / LICENSE_REVOKED / "
                     "LICENSE_SUSPENDED / QUOTA_EXHAUSTED / POOL_EXHAUSTED"
     )
-    remaining_quota: Optional[int] = Field(description="本次消耗后该授权自身的剩余额度")
+    remaining_quota: Optional[int] = Field(description="本次消耗后该授权自身的剩余额度（快照，取消不回写）")
     pool_remaining_quota: Optional[int] = Field(
-        description="本次消耗后所绑共享池的剩余额度；授权未绑池或被拒绝时为 null"
+        description="本次消耗后所绑共享池的剩余额度（快照，取消不回写）；授权未绑池或被拒绝时为 null"
     )
     verified_at: str
     replay: bool = Field(description="true 表示本次为幂等重放，未重新扣减额度")
+    cancelled: bool = Field(description="该流水是否已登记场次取消")
+    cancellation: Optional[CancellationOut] = Field(
+        description="取消详情（原因与取消时间）；未取消为 null"
+    )
+
+
+class CancelRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500, examples=["放映设备故障，场次取消"])
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value
+
+
+class CancelOut(BaseModel):
+    id: int = Field(description="取消记录编号")
+    idempotency_key: str = Field(description="原核验幂等键")
+    verification_id: int = Field(description="被取消的核验流水 id")
+    license_id: int = Field(description="释放一次已用次数的授权 id")
+    pool_id: Optional[int] = Field(description="同步释放一次的共享池 id；授权未绑池为 null")
+    reason: str
+    cancelled_at: str = Field(description="取消登记时间（UTC）")
+    replay: bool = Field(
+        description="true 表示重复提交同一取消，返回首次记录，未重复释放额度"
+    )
